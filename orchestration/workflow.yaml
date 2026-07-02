@@ -1,0 +1,50 @@
+# =====================================================================
+# orchestration/workflow.yaml — Cloud Workflows (serverless orchestration)
+# Runs the pipeline as discrete, observable steps with test-gating: if the
+# data-quality ASSERTs fail, the workflow fails and the marts are NOT trusted.
+# This is the "no Composer" GCP-native orchestrator. Deploy with
+# orchestration/deploy_workflow.sh, trigger daily via Cloud Scheduler.
+# =====================================================================
+main:
+  steps:
+    - init:
+        assign:
+          - project: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+
+    - load_raw:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${project}
+          body:
+            useLegacySql: false
+            query: "CALL marts.sp_load_raw();"
+
+    - build_marts:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${project}
+          body:
+            useLegacySql: false
+            query: "CALL marts.sp_build_marts();"
+
+    # Test gate: this query fails (raises) if any ASSERT is violated, which
+    # fails the whole workflow run and pages via the Scheduler/alerting policy.
+    - run_tests:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${project}
+          body:
+            useLegacySql: false
+            query: |
+              ASSERT (SELECT COUNT(*) FROM (
+                SELECT date_day, platform, campaign_id
+                FROM marts.fct_ad_performance_daily
+                GROUP BY 1,2,3 HAVING COUNT(*) > 1)) = 0
+                AS 'fct grain not unique';
+              ASSERT (SELECT COUNT(*) FROM marts.fct_ad_performance_daily f
+                LEFT JOIN marts.dim_campaign c USING (campaign_id)
+                WHERE c.campaign_id IS NULL) = 0
+                AS 'fact campaign missing from dim';
+
+    - done:
+        return: "pipeline + tests succeeded"
